@@ -1,0 +1,7 @@
+pytest==7.4.3
+pytest-xdist==3.5.0
+pytest-rerunfailures==15.1
+selenium==4.15.2
+allure-pytest==2.13.2
+allure-python-commons==2.13.2
+python-dotenv==1.0.1

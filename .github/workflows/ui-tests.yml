@@ -1,0 +1,263 @@
+name: UI Tests with Allure Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_suite:
+        description: 'Select test suite to run'
+        type: choice
+        required: true
+        default: 'critical'
+        options: [all, critical, medium, smoke, negative, regression]
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ui-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  download-history:
+    name: 📥 Download previous test history
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download history via GitHub CLI
+        id: download-history
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          echo "Looking for previous runs..."
+          RUN_ID=$(gh run list --status completed --limit 10 --json databaseId \
+            | jq -r --arg CID "${{ github.run_id }}" '.[] | select(.databaseId | tostring != $CID) | .databaseId' \
+            | head -n 1)
+
+          if [ -z "$RUN_ID" ]; then
+            echo "No previous runs found."
+            exit 0
+          fi
+          echo "Found previous run ID: $RUN_ID"
+
+          mkdir -p previous-history
+          gh run download $RUN_ID --name allure-history --dir previous-history || echo "Artifact not found"
+
+      - name: Upload history transport
+        uses: actions/upload-artifact@v4
+        with:
+          name: internal-history-transport
+          path: previous-history
+          retention-days: 1
+          if-no-files-found: ignore
+
+  run-ui-tests:
+    name: 🧪 Run UI Tests
+    runs-on: ubuntu-latest
+    needs: download-history
+    env:
+      BASE_URL: ${{ secrets.BASE_URL }}
+      BROWSER: chrome
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Download history transport
+        uses: actions/download-artifact@v4
+        with:
+          name: internal-history-transport
+          path: previous-history
+        continue-on-error: true
+
+      - name: Verify repository secrets are set
+        run: |
+          if [ -z "${BASE_URL}" ]; then
+            echo "::error::Secret BASE_URL is empty. Add it in Settings → Secrets and variables → Actions (Repository secrets)."
+            exit 1
+          fi
+          echo "Required secrets are present (values not printed)."
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run mypy
+        run: mypy
+
+      - name: Run UI tests
+        id: pytest
+        run: |
+          SELECTED_SUITE="${{ github.event.inputs.test_suite || 'all' }}"
+          if [ "$SELECTED_SUITE" = "all" ]; then
+            pytest -n 2 --reruns 1 --reruns-delay 1 --alluredir=allure-results
+          else
+            pytest -n 2 -m "$SELECTED_SUITE" --reruns 1 --reruns-delay 1 --alluredir=allure-results
+          fi
+
+      # Resolve conflict with pytest.ini: restore history AFTER pytest cleans the folder
+      - name: Restore history for Trends
+        if: always() && !cancelled()
+        run: |
+          mkdir -p allure-results/history
+          if [ -d "previous-history" ] && [ -n "$(ls -A previous-history)" ]; then
+            cp -r previous-history/* allure-results/history/
+            echo "History restored after pytest"
+          fi
+
+      - name: Report test statistics
+        if: always() && !cancelled()
+        run: |
+          echo "TEST STATISTICS:"
+          if [ -d "allure-results/history" ]; then
+            echo "History files for Trends: $(find allure-results/history -type f | wc -l)"
+          fi
+
+      - name: Save results
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results-raw
+          path: allure-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+  smoke-browsers:
+    name: 🌐 Smoke (${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chrome, firefox]
+    env:
+      BASE_URL: ${{ secrets.BASE_URL }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Verify repository secrets are set
+        run: |
+          if [ -z "${BASE_URL}" ]; then
+            echo "::error::Secret BASE_URL is empty. Add it in Settings → Secrets and variables → Actions (Repository secrets)."
+            exit 1
+          fi
+          echo "Required secrets are present (values not printed)."
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run smoke
+        run: >
+          pytest -m smoke
+          --browser ${{ matrix.browser }}
+          --reruns 1 --reruns-delay 1
+          --alluredir=allure-results
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-smoke-${{ matrix.browser }}
+          path: allure-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+  generate-allure-report:
+    name: 📊 Generate Allure Report
+    runs-on: ubuntu-latest
+    needs: run-ui-tests
+    if: always() && needs.run-ui-tests.result != 'cancelled'
+    steps:
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-results-raw
+          path: allure-results
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Allure CLI
+        run: |
+          sudo npm install -g allure-commandline --save-dev
+          allure --version
+
+      - name: Generate Allure report
+        run: |
+          allure generate allure-results -o _site --clean
+
+      - name: Prepare history for FUTURE runs
+        run: |
+          mkdir -p allure-history-folder
+          if [ -d "_site/history" ]; then
+            cp -r _site/history/* allure-history-folder/
+            echo "New history saved"
+          fi
+
+      # Only green runs on push — keep the last successful Pages report public.
+      - name: Upload Pages artifact
+        if: >
+          needs.run-ui-tests.result == 'success'
+          && github.event_name == 'push'
+          && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: '_site'
+
+      # Keep a downloadable report for PR / manual runs (and as a backup on push)
+      - name: Upload Allure report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report
+          path: '_site'
+          retention-days: 7
+
+      - name: Upload History Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-history
+          path: allure-history-folder
+          retention-days: 7
+          if-no-files-found: ignore
+
+  deploy-to-pages:
+    name: 🚀 Deploy to Pages
+    runs-on: ubuntu-latest
+    needs: [run-ui-tests, generate-allure-report]
+    if: >
+      needs.run-ui-tests.result == 'success'
+      && needs.generate-allure-report.result == 'success'
+      && github.event_name == 'push'
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
